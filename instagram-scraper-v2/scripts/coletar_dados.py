@@ -1,7 +1,23 @@
+"""Coleta um perfil do Instagram usando a sua sessão logada.
+
+Mídia (fotos e vídeos de posts, reels, stories e destaques) é baixada nos
+arquivos originais (.jpg / .mp4). Os .json guardam só dados de texto:
+histórico do perfil, seguidores, seguindo e legendas/datas/curtidas.
+
+Como funciona: o script navega pelo perfil como uma pessoa faria e lê os
+dados que o próprio site do Instagram carrega (respostas GraphQL e o JSON
+embutido no HTML). Os endereços antigos da API (/api/v1/feed/...) passaram
+a devolver só a página HTML, por isso não são mais usados para mídia.
+
+Limites (para não chamar atenção do Instagram) podem ser mudados por
+variável de ambiente: LIMITE_POSTS, LIMITE_REELS e LIMITE_LISTA.
+"""
+
 import json
-import time
 import os
+import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -11,6 +27,25 @@ PASTA_DADOS = RAIZ / "dados"
 ARQUIVO_ESTADO = PASTA_DADOS / "estado_login.json"
 MODO_TESTE = os.environ.get("MODO_TESTE") == "1"
 
+LIMITE_POSTS = int(os.environ.get("LIMITE_POSTS", "30"))
+LIMITE_REELS = int(os.environ.get("LIMITE_REELS", "30"))
+LIMITE_LISTA = int(os.environ.get("LIMITE_LISTA", "30"))
+PAUSA = 1.2  # segundos entre chamadas à API
+INDISPONIVEL = "Dado indisponivel"
+
+
+def novo_contexto(browser, **kwargs):
+    """Contexto que se apresenta como Chrome comum.
+
+    O modo invisível se identifica como "HeadlessChrome", e o Instagram
+    bloqueia (429) a sessão logada quando vê isso.
+    """
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          f"(KHTML, like Gecko) Chrome/{browser.version} Safari/537.36")
+    return browser.new_context(user_agent=ua, locale="pt-BR",
+                               viewport={"width": 1366, "height": 900}, **kwargs)
+
+
 def autenticar(p):
     browser = None
     context = None
@@ -19,7 +54,7 @@ def autenticar(p):
     if ARQUIVO_ESTADO.exists() and not MODO_TESTE:
         print("Sessao encontrada. Tentando usar o cache de login...")
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=str(ARQUIVO_ESTADO))
+        context = novo_contexto(browser, storage_state=str(ARQUIVO_ESTADO))
         page = context.new_page()
         page.goto("https://www.instagram.com/", wait_until="networkidle", timeout=60000)
 
@@ -34,7 +69,7 @@ def autenticar(p):
     if MODO_TESTE:
         print("Modo teste ativado: pulando login visual. Usaremos modo headless.")
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        context = novo_contexto(browser)
         page = context.new_page()
         return browser, context, page
 
@@ -44,7 +79,7 @@ def autenticar(p):
     print("=======================================")
 
     browser = p.chromium.launch(headless=False)
-    context = browser.new_context()
+    context = novo_contexto(browser)
     page = context.new_page()
     page.goto("https://www.instagram.com/accounts/login/")
 
@@ -53,214 +88,472 @@ def autenticar(p):
         page.wait_for_timeout(3000)
         context.storage_state(path=str(ARQUIVO_ESTADO))
         print("Login detectado e sessao salva com sucesso!")
-    except Exception as e:
+    except Exception:
         print("Tempo esgotado ou janela fechada antes do login.")
 
     return browser, context, page
 
-def salvar_lista(lista, arquivo):
-    arquivo.write_text(json.dumps(lista, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def extrair_modal_lista(page, link_texto, max_items=20):
-    usuarios = []
+# ---------------------------------------------------------------- leitura do que o site carrega
+
+
+def ler_json_do_site(texto):
+    """Respostas GraphQL vêm como text/javascript, às vezes várias linhas JSON."""
+    texto = (texto or "").lstrip()
+    if texto.startswith("for (;;);"):
+        texto = texto[9:]
+    docs = []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if linha.startswith("{"):
+            try:
+                docs.append(json.loads(linha))
+            except ValueError:
+                pass
+    if not docs:
+        try:
+            docs.append(json.loads(texto))
+        except ValueError:
+            pass
+    return docs
+
+
+class Captura:
+    """Guarda as respostas GraphQL que a página recebe: [(nome da consulta, json)]."""
+
+    def __init__(self, page):
+        self.docs = []
+        page.on("response", self._on_response)
+
+    def _on_response(self, resp):
+        if "graphql" not in resp.url:
+            return
+        try:
+            nome = resp.request.headers.get("x-fb-friendly-name", "")
+            for doc in ler_json_do_site(resp.text()):
+                self.docs.append((nome, doc))
+        except Exception:
+            pass  # resposta de redirecionamento ou já descartada pelo navegador
+
+    def limpar(self):
+        self.docs.clear()
+
+    def de(self, *trechos):
+        return [d for nome, d in self.docs if any(t in nome for t in trechos)]
+
+
+def json_embutido(page):
+    docs = []
+    for script in page.locator('script[type="application/json"]').all():
+        try:
+            docs.append(json.loads(script.text_content()))
+        except Exception:
+            pass
+    return docs
+
+
+def e_midia(d):
+    return isinstance(d, dict) and "taken_at" in d and ("video_versions" in d or "image_versions2" in d)
+
+
+def achar_midias(obj, saida=None):
+    """Todas as mídias (posts/stories) dentro de um JSON, sem descer nos filhos de carrossel."""
+    saida = [] if saida is None else saida
+    if isinstance(obj, dict):
+        if e_midia(obj):
+            saida.append(obj)
+            return saida
+        for v in obj.values():
+            achar_midias(v, saida)
+    elif isinstance(obj, list):
+        for v in obj:
+            achar_midias(v, saida)
+    return saida
+
+
+def achar_reels_de_story(obj, saida=None):
+    """{id do reel: objeto com 'items' e 'title'}; o id é o do usuário (stories) ou 'highlight:...'."""
+    saida = {} if saida is None else saida
+    if isinstance(obj, dict):
+        itens = obj.get("items")
+        if obj.get("id") and isinstance(itens, list) and itens and e_midia(itens[0]):
+            saida.setdefault(str(obj["id"]), obj)
+        for v in obj.values():
+            achar_reels_de_story(v, saida)
+    elif isinstance(obj, list):
+        for v in obj:
+            achar_reels_de_story(v, saida)
+    return saida
+
+
+def achar_chave(obj, chave):
+    if isinstance(obj, dict):
+        if chave in obj:
+            return obj[chave]
+        for v in obj.values():
+            r = achar_chave(v, chave)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = achar_chave(v, chave)
+            if r is not None:
+                return r
+    return None
+
+
+def unicos(midias):
+    vistos = {}
+    for m in midias:
+        vistos.setdefault(str(m.get("pk") or m.get("id")), m)
+    return sorted(vistos.values(), key=lambda m: m.get("taken_at") or 0, reverse=True)
+
+
+def rolar_e_coletar(page, captura, consultas, limite):
+    """Rola a página até ter `limite` mídias das consultas indicadas (ou parar de vir novas)."""
+    midias, parado = [], 0
+    while parado < 3:
+        midias = unicos(m for d in captura.de(*consultas) for m in achar_midias(d))
+        if len(midias) >= limite:
+            break
+        antes = len(midias)
+        page.mouse.wheel(0, 4000)
+        page.wait_for_timeout(2500)
+        depois = len(unicos(m for d in captura.de(*consultas) for m in achar_midias(d)))
+        parado = parado + 1 if depois == antes else 0
+    return midias[:limite]
+
+
+# ---------------------------------------------------------------- API (só para listas e plano B)
+
+
+def ig_api(page, path, form=None, tentativas=3):
+    """Chama a API do Instagram de dentro da página (usa os cookies da sessão logada).
+
+    Em 429 (muitas requisições) espera e tenta de novo: 20s, 40s, 80s.
+    """
+    for n in range(tentativas + 1):
+        res = _chamar(page, path, form)
+        if res["status"] != 429 or n == tentativas:
+            break
+        espera = 20 * 2 ** n
+        print(f"  Instagram pediu para ir mais devagar (429). Esperando {espera}s...")
+        time.sleep(espera)
+    if res["status"] != 200 or not isinstance(res["body"], dict):
+        msg = (res["body"] or {}).get("message", "") if isinstance(res["body"], dict) else ""
+        tipo = "" if isinstance(res["body"], dict) else " (veio pagina HTML em vez de dados)"
+        raise RuntimeError(f"API {path.split('?')[0]} respondeu {res['status']} {msg}{tipo}".strip())
+    return res["body"]
+
+
+def _chamar(page, path, form):
+    res = page.evaluate(
+        """async ({path, form}) => {
+            const csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+            const opts = {method: form ? 'POST' : 'GET', credentials: 'include',
+                          headers: {'x-ig-app-id': '936619743392459', 'x-csrftoken': csrf,
+                                    'x-requested-with': 'XMLHttpRequest'}};
+            if (form) {
+                opts.body = new URLSearchParams(form).toString();
+                opts.headers['content-type'] = 'application/x-www-form-urlencoded';
+            }
+            const r = await fetch(path, opts);
+            let body = null;
+            try { body = await r.json(); } catch (e) {}
+            return {status: r.status, body};
+        }""",
+        {"path": path, "form": form},
+    )
+    time.sleep(PAUSA)
+    return res
+
+
+def buscar_lista(page, uid, qual):
+    corpo = ig_api(page, f"/api/v1/friendships/{uid}/{qual}/?count={LIMITE_LISTA}", tentativas=1)
+    return [{"usuario": u.get("username"), "nome": u.get("full_name"),
+             "privado": u.get("is_private"), "verificado": u.get("is_verified")}
+            for u in corpo.get("users", [])][:LIMITE_LISTA]
+
+
+# ---------------------------------------------------------------- download
+
+
+def arquivos_da_midia(item):
+    """[(url, extensão)] do arquivo original de cada mídia (carrossel vira vários)."""
+    partes = item.get("carousel_media") or [item]
+    saida = []
+    for m in partes:
+        videos = m.get("video_versions") or []
+        if videos:
+            melhor = max(videos, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+            saida.append((melhor["url"], "mp4"))
+            continue
+        fotos = (m.get("image_versions2") or {}).get("candidates") or []
+        if fotos:
+            melhor = max(fotos, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+            saida.append((melhor["url"], "jpg"))
+    return saida
+
+
+def baixar(context, url, destino):
+    if destino.exists() and destino.stat().st_size > 0:
+        return True  # já baixado numa coleta anterior
     try:
-        links = page.locator(f"a:has-text('{link_texto}')")
-        if links.count() == 0:
-            return usuarios
-
-        links.first.click()
-        page.wait_for_timeout(2000)
-
-        dialog = page.locator("div[role='dialog']")
-        if dialog.count() == 0:
-            return usuarios
-
-        for _ in range(3):
-            page.evaluate("() => { const el = document.querySelector('div[role=\"dialog\"] div[style*=\"overflow-y: auto\"]') || document.querySelector('div[role=\"dialog\"] div[style*=\"overflow-y: scroll\"]'); if(el) el.scrollTop = el.scrollHeight; }")
-            page.wait_for_timeout(1500)
-
-            items = dialog.locator("span.x1lliihq").all()
-            for item in items:
-                nome = item.text_content()
-                if nome and nome not in usuarios and len(nome) > 2:
-                    usuarios.append(nome)
-
-            if len(usuarios) >= max_items:
-                break
-
-        close_btn = dialog.locator("svg[aria-label='Close']").locator("..")
-        if close_btn.count() > 0:
-            close_btn.first.click()
-            page.wait_for_timeout(1000)
-
+        r = context.request.get(url, timeout=120000)
+        if r.ok:
+            destino.write_bytes(r.body())
+            return True
+        print(f"  falha ao baixar {destino.name}: HTTP {r.status}")
     except Exception as e:
-        print(f"Erro ao extrair modal {link_texto}: {e}")
+        print(f"  falha ao baixar {destino.name}: {e}")
+    return False
 
-    return list(set(usuarios))
+
+def data_de(item):
+    ts = item.get("taken_at") or item.get("device_timestamp") or 0
+    if ts > 10**11:  # alguns vêm em microssegundos
+        ts //= 10**6
+    return datetime.fromtimestamp(ts) if ts else datetime.now()
+
+
+def salvar_midias(context, itens, pasta, tipo, detalhado=True):
+    """Baixa a mídia de cada item e devolve os metadados (texto) para o JSON."""
+    registros = []
+    for item in itens:
+        quando = data_de(item)
+        codigo = item.get("code") or str(item.get("pk") or item.get("id", "")).split("_")[0]
+        arquivos = []
+        for n, (url, ext) in enumerate(arquivos_da_midia(item), 1):
+            sufixo = f"_{n}" if len(item.get("carousel_media") or []) > 1 else ""
+            destino = pasta / f"{quando:%Y-%m-%d_%H%M%S}_{codigo}{sufixo}.{ext}"
+            if baixar(context, url, destino):
+                arquivos.append(destino.name)
+        legenda = (item.get("caption") or {}).get("text", "") if isinstance(item.get("caption"), dict) else ""
+        dono = (item.get("user") or item.get("owner") or {}).get("username")
+        registros.append({
+            "codigo": codigo,
+            "link": f"https://www.instagram.com/{'reel' if tipo == 'reel' else 'p'}/{codigo}/" if item.get("code") else None,
+            "tipo": "carrossel" if item.get("carousel_media") else ("video" if item.get("video_versions") else "foto"),
+            "data": quando.isoformat(timespec="seconds"),
+            "autor": dono,
+            "legenda": legenda,
+            "curtidas": item.get("like_count"),
+            "comentarios": item.get("comment_count"),
+            "visualizacoes": item.get("play_count") or item.get("view_count"),
+            "arquivos": arquivos,
+        })
+        if detalhado:
+            print(f"  {tipo} {codigo}: {len(arquivos)} arquivo(s)")
+    return registros
+
+
+# ---------------------------------------------------------------- coleta
+
+
+def salvar_json(dados, arquivo):
+    arquivo.write_text(json.dumps(dados, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def ler_json(arquivo, padrao):
+    try:
+        return json.loads(arquivo.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return padrao
+
+
+def etapa(nome, funcao, erros):
+    """Roda uma parte da coleta; se falhar, registra e segue com as outras."""
+    try:
+        return funcao()
+    except Exception as e:
+        print(f"[aviso] {nome}: {e}")
+        erros[nome] = str(e)
+        return None
+
+
+def dados_do_cabecalho(page, dados):
+    """Plano B: números do cabeçalho visível da página."""
+    try:
+        lis = page.locator("header ul li").all()
+        if len(lis) >= 3:
+            dados["posts_count"] = lis[0].text_content().split()[0].strip()
+            dados["seguidores"] = (lis[1].locator("a, span").first.get_attribute("title")
+                                   or lis[1].text_content().split()[0].strip())
+            dados["seguindo"] = lis[2].text_content().split()[0].strip()
+    except Exception:
+        pass
+
+
+def ler_perfil(captura, page, username, dados):
+    """Preenche os dados do perfil a partir do que a página do perfil carregou."""
+    usuario = None
+    for doc in captura.de("ProfilePageContent") + json_embutido(page):
+        u = achar_chave(doc, "user")
+        if isinstance(u, dict) and u.get("username") == username and ("follower_count" in u or "pk" in u):
+            usuario = u
+            break
+    if usuario:
+        dados.update({
+            "id": str(usuario.get("pk") or usuario.get("id") or "") or None,
+            "nome": usuario.get("full_name") or INDISPONIVEL,
+            "biografia": usuario.get("biography", ""),
+            "seguidores": usuario.get("follower_count", INDISPONIVEL),
+            "seguindo": usuario.get("following_count", INDISPONIVEL),
+            "posts_count": usuario.get("media_count", INDISPONIVEL),
+            "privado": usuario.get("is_private"),
+            "verificado": usuario.get("is_verified"),
+            "link_externo": usuario.get("external_url"),
+            "foto_perfil_url": (usuario.get("hd_profile_pic_url_info") or {}).get("url")
+                               or usuario.get("profile_pic_url"),
+            "voce_segue": (usuario.get("friendship_status") or {}).get("following"),
+        })
+    else:
+        dados_do_cabecalho(page, dados)
+    if not dados.get("id"):
+        m = re.search(r'"profilePage_(\d+)"|"profile_id":"(\d+)"', page.content())
+        if m:
+            dados["id"] = next(g for g in m.groups() if g)
+    return usuario is not None
+
 
 def coletar_alvo(username):
     PASTA_PERFIL = PASTA_DADOS / username
-    PASTA_PERFIL.mkdir(parents=True, exist_ok=True)
-    PASTA_POSTS = PASTA_PERFIL / "posts"
-    PASTA_POSTS.mkdir(exist_ok=True)
-    PASTA_REELS = PASTA_PERFIL / "reels"
-    PASTA_REELS.mkdir(exist_ok=True)
-    PASTA_STORIES = PASTA_PERFIL / "stories"
-    PASTA_STORIES.mkdir(exist_ok=True)
+    pastas = {nome: PASTA_PERFIL / nome for nome in ("posts", "reels", "stories", "destaques")}
+    for pasta in [PASTA_PERFIL, *pastas.values()]:
+        pasta.mkdir(parents=True, exist_ok=True)
 
     dados_gerais = {
         "usuario": username,
-        "seguidores": "Dado indisponivel",
-        "seguindo": "Dado indisponivel",
-        "posts_count": "Dado indisponivel",
-        "nome": "Dado indisponivel",
-        "data_coleta": datetime.now().isoformat()
+        "nome": INDISPONIVEL,
+        "biografia": "",
+        "seguidores": INDISPONIVEL,
+        "seguindo": INDISPONIVEL,
+        "posts_count": INDISPONIVEL,
+        "privado": None,
+        "data_coleta": datetime.now().isoformat(timespec="seconds"),
     }
+    erros = {}
 
     with sync_playwright() as p:
         browser, context, page = autenticar(p)
+        logado = any(c["name"] == "sessionid" for c in context.cookies())
+        captura = Captura(page)
 
         url_alvo = f"https://www.instagram.com/{username}/"
         print(f"Acessando o perfil {url_alvo}...")
         try:
-            page.goto(url_alvo, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(3000)
+            page.goto(url_alvo, wait_until="load", timeout=60000)
+            page.wait_for_timeout(7000)
+            ler_perfil(captura, page, username, dados_gerais)
+            foto = dados_gerais.pop("foto_perfil_url", None)
+            if foto and baixar(context, foto, PASTA_PERFIL / "foto_perfil.jpg"):
+                print("Foto de perfil salva!")
 
-            if "Page Not Found" in page.title() or "nao encontrada" in page.title().lower():
-                print("Perfil nao encontrado.")
-                dados_gerais["erro"] = "Perfil nao encontrado ou bloqueado"
+            uid = dados_gerais.get("id")
+            if not logado:
+                print("Sem login: baixando so os dados publicos do perfil.")
+            elif dados_gerais.get("privado") and not dados_gerais.get("voce_segue"):
+                print("Perfil privado que voce nao segue: so os dados publicos estao disponiveis.")
             else:
-                # HEADER NUMBERS
-                try:
-                    header_ul = page.locator("header ul").first
-                    if header_ul.count() > 0:
-                        lis = header_ul.locator("li").all()
-                        if len(lis) >= 3:
-                            dados_gerais["posts_count"] = lis[0].text_content().split()[0].strip()
-                            dados_gerais["seguidores"] = lis[1].locator("a, span").first.get_attribute("title") or lis[1].text_content().split()[0].strip()
-                            dados_gerais["seguindo"] = lis[2].text_content().split()[0].strip()
-                except Exception:
-                    pass
+                # Destaques: a lista vem junto com a página do perfil.
+                bandeja = []
+                for doc in captura.de("Highlights"):
+                    for edge in (achar_chave(doc, "edges") or []):
+                        node = edge.get("node") or {}
+                        if str(node.get("id", "")).startswith("highlight:"):
+                            bandeja.append({"id": node["id"], "titulo": node.get("title") or ""})
+                if not bandeja:  # formato mudou: pega pelo menos os ids
+                    texto = json.dumps([d for _, d in captura.docs]) + page.content()
+                    bandeja = [{"id": h, "titulo": ""} for h in dict.fromkeys(re.findall(r"highlight:\d+", texto))]
 
-                # NOME
-                try:
-                    nome_loc = page.locator("header section > div").nth(2).locator("span").first
-                    if nome_loc.count() > 0:
-                        dados_gerais["nome"] = nome_loc.text_content().strip()
-                except:
-                    pass
+                print(f"Baixando posts (ate {LIMITE_POSTS})...")
+                posts = etapa("posts", lambda: rolar_e_coletar(page, captura, ("ProfilePosts",), LIMITE_POSTS),
+                              erros) or []
+                salvar_json(salvar_midias(context, posts, pastas["posts"], "post"), pastas["posts"] / "posts.json")
 
-                # FOTO PERFIL
-                try:
-                    print("Buscando foto de perfil...")
-                    img_loc = page.locator("header img").first
-                    if img_loc.count() > 0:
-                        src = img_loc.get_attribute("src")
-                        if src:
-                            dados_gerais["foto_perfil_url"] = src
-                            response = context.request.get(src)
-                            if response.ok:
-                                img_path = PASTA_PERFIL / "foto_perfil.jpg"
-                                img_path.write_bytes(response.body())
-                                print("Foto de perfil salva!")
-                except Exception as e:
-                    print(f"Erro na foto de perfil: {e}")
+                print(f"Baixando reels (ate {LIMITE_REELS})...")
+                captura.limpar()
+                page.goto(f"{url_alvo}reels/", wait_until="load", timeout=60000)
+                page.wait_for_timeout(6000)
+                reels = etapa("reels", lambda: rolar_e_coletar(page, captura, ("Reels", "Clips"), LIMITE_REELS),
+                              erros) or []
+                salvar_json(salvar_midias(context, reels, pastas["reels"], "reel"), pastas["reels"] / "reels.json")
+                if not reels:
+                    print("  nenhum reel encontrado.")
 
-                if not MODO_TESTE:
-                    # EXTRAIR LISTAS
-                    print("Extraindo seguidores visiveis...")
-                    seguidores = extrair_modal_lista(page, "followers", 30)
-                    salvar_lista(seguidores, PASTA_PERFIL / "seguidores.json")
+                print("Baixando stories ativos...")
+                stories = []
+                if uid:
+                    captura.limpar()
+                    page.goto(f"https://www.instagram.com/stories/{username}/", wait_until="load", timeout=60000)
+                    page.wait_for_timeout(5000)
+                    if "/stories/" in page.url:
+                        reels_story = {}
+                        for doc in json_embutido(page) + [d for _, d in captura.docs]:
+                            achar_reels_de_story(doc, reels_story)
+                        stories = (reels_story.get(uid) or {}).get("items", [])
+                salvar_json(salvar_midias(context, stories, pastas["stories"], "story"),
+                            pastas["stories"] / "stories.json")
+                if not stories:
+                    print("  nenhum story ativo agora.")
 
-                    print("Extraindo seguindo visiveis...")
-                    seguindo = extrair_modal_lista(page, "following", 30)
-                    salvar_lista(seguindo, PASTA_PERFIL / "seguindo.json")
+                print(f"Baixando destaques ({len(bandeja)})...")
+                resumo_destaques = []
+                for d in bandeja:
+                    numero = d["id"].split(":")[-1]
+                    captura.limpar()
+                    page.goto(f"https://www.instagram.com/stories/highlights/{numero}/", wait_until="load", timeout=60000)
+                    page.wait_for_timeout(5000)
+                    reels_story = {}
+                    for doc in json_embutido(page) + [x for _, x in captura.docs]:
+                        achar_reels_de_story(doc, reels_story)
+                    reel = reels_story.get(d["id"]) or {}
+                    nome = d["titulo"] or reel.get("title") or ""
+                    pasta_nome = "".join(ch for ch in nome if ch.isalnum() or ch in " -_").strip()
+                    pasta_d = pastas["destaques"] / (f"{pasta_nome}_{numero[-4:]}" if pasta_nome else numero)
+                    pasta_d.mkdir(exist_ok=True)
+                    registros = salvar_midias(context, reel.get("items", []), pasta_d, "destaque", detalhado=False)
+                    salvar_json(registros, pasta_d / "destaque.json")
+                    print(f"  destaque '{nome or numero}': {sum(len(r['arquivos']) for r in registros)} arquivo(s)")
+                    resumo_destaques.append({"titulo": nome, "itens": len(registros)})
+                dados_gerais["destaques"] = resumo_destaques
 
-                    # POSTS LINKS E THUMBNAILS
-                    print("Extraindo thumbnails dos posts mais recentes...")
-                    posts = page.locator("article a").all()
-                    urls_posts = []
-                    for i, post in enumerate(posts[:12]):
-                        try:
-                            href = post.get_attribute("href")
-                            img = post.locator("img").first
-                            if img.count() > 0:
-                                src = img.get_attribute("src")
-                                if src:
-                                    res = context.request.get(src)
-                                    if res.ok:
-                                        p_path = PASTA_POSTS / f"post_{i}.jpg"
-                                        p_path.write_bytes(res.body())
-                                    urls_posts.append(href)
-                        except:
-                            pass
-                    salvar_lista(urls_posts, PASTA_POSTS / "links_posts.json")
+                if uid:
+                    page.goto(url_alvo, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(3000)
+                    print(f"Extraindo seguidores (ate {LIMITE_LISTA})...")
+                    seguidores = etapa("seguidores", lambda: buscar_lista(page, uid, "followers"), erros)
+                    if seguidores is not None:
+                        salvar_json(seguidores, PASTA_PERFIL / "seguidores.json")
+                    print(f"Extraindo seguindo (ate {LIMITE_LISTA})...")
+                    seguindo = etapa("seguindo", lambda: buscar_lista(page, uid, "following"), erros)
+                    if seguindo is not None:
+                        salvar_json(seguindo, PASTA_PERFIL / "seguindo.json")
 
-                    # EXTRAIR REELS
-                    print("Extraindo thumbnails dos reels (se houver guia)...")
-                    try:
-                        reels_tab = page.locator("a:has-text('Reels')").first
-                        if reels_tab.count() > 0:
-                            reels_tab.click()
-                            page.wait_for_timeout(3000)
-                            reels = page.locator("article a").all()
-                            urls_reels = []
-                            for i, reel in enumerate(reels[:12]):
-                                try:
-                                    href = reel.get_attribute("href")
-                                    img = reel.locator("img").first
-                                    if img.count() > 0:
-                                        src = img.get_attribute("src")
-                                        if src:
-                                            res = context.request.get(src)
-                                            if res.ok:
-                                                r_path = PASTA_REELS / f"reel_{i}.jpg"
-                                                r_path.write_bytes(res.body())
-                                            urls_reels.append(href)
-                                except:
-                                    pass
-                            salvar_lista(urls_reels, PASTA_REELS / "links_reels.json")
-
-                            # Voltar a Posts originais
-                            page.go_back()
-                    except Exception as e:
-                        print("Erro extraindo reels:", e)
-
-                    # EXTRAIR STORIES
-                    print("Extraindo historico/stories visiveis...")
-                    try:
-                        story_avatar = page.locator("canvas[aria-label='Story']").first
-                        if story_avatar.count() > 0:
-                            print("Tem story! Tirando screenshot e salvando link/src.")
-                            story_avatar.click()
-                            page.wait_for_timeout(3000)
-
-                            for i in range(5):
-                                st_path = PASTA_STORIES / f"story_{i}.png"
-                                page.screenshot(path=str(st_path))
-
-                                next_btn = page.locator("button[aria-label='Next']").first
-                                if next_btn.count() > 0:
-                                    next_btn.click()
-                                    page.wait_for_timeout(1500)
-                                else:
-                                    break
-
-                            close_st = page.locator("svg[aria-label='Close']").first
-                            if close_st.count() > 0:
-                                close_st.click()
-                    except Exception as e:
-                        print("Erro extraindo stories:", e)
-
+                dados_gerais["baixados"] = {
+                    "posts": len(posts), "reels": len(reels), "stories": len(stories),
+                    "destaques": sum(d["itens"] for d in resumo_destaques),
+                }
         except Exception as e:
             print(f"Erro durante o acesso ao perfil: {e}")
+            erros["acesso"] = str(e)
 
         browser.close()
 
+    dados_gerais.pop("voce_segue", None)
+    if erros:
+        dados_gerais["avisos"] = erros
+
+    # Histórico: os números de cada coleta ficam guardados para comparar com o tempo.
     ARQUIVO_JSON = PASTA_PERFIL / "historico_perfil.json"
-    ARQUIVO_JSON.write_text(json.dumps(dados_gerais, indent=2, ensure_ascii=False), encoding="utf-8")
+    anterior = ler_json(ARQUIVO_JSON, {})
+    historico = anterior.get("historico", []) if isinstance(anterior, dict) else []
+    historico.append({k: dados_gerais.get(k) for k in ("data_coleta", "seguidores", "seguindo", "posts_count")})
+    dados_gerais["historico"] = historico
+    salvar_json(dados_gerais, ARQUIVO_JSON)
     print(f"Dados gerais salvos em {ARQUIVO_JSON}")
+
 
 if __name__ == "__main__":
     alvo = sys.argv[1] if len(sys.argv) > 1 else "cristiano"
-    coletar_alvo(alvo)
+    coletar_alvo(alvo.lstrip("@").strip())
