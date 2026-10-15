@@ -63,11 +63,14 @@ def on_submit():
         info_text.delete(1.0, tk.END)
 
         info = (
-            f"Perfil: @{dados.get('username', username)}\n"
+            f"Perfil: {dados.get('nome', '')} (@{dados.get('username', username)})\n"
             f"Seguidores: {dados.get('followers', 'Dado indisponível')}\n"
             f"Seguindo: {dados.get('following', 'Dado indisponível')}\n"
             f"Publicações: {dados.get('posts', 'Dado indisponível')}\n"
-            f"\nFoto de perfil e posts recentes salvos em:\n{RAIZ / 'dados'}"
+            f"Lista de seguidores / stories: exige login no Instagram\n"
+            f"\n{len(dados.get('arquivos', []))} arquivos (print, foto de perfil e posts) em:\n"
+            f"{dados.get('pasta', RAIZ / 'dados')}\n"
+            f"Fonte: {dados.get('metodo', '')}, em {dados.get('data_coleta', '')}"
         )
         info_text.insert(tk.END, info)
         info_text.config(state=tk.DISABLED)
@@ -83,7 +86,7 @@ def on_submit():
 
 root = tk.Tk()
 root.title("Instagram Scraper")
-root.geometry("450x350")
+root.geometry("480x420")
 root.resizable(False, False)
 
 frame = tk.Frame(root, padx=20, pady=20)
@@ -108,7 +111,7 @@ lbl_warning = tk.Label(
 )
 lbl_warning.pack(pady=5)
 
-info_text = tk.Text(frame, height=8, width=50, state=tk.DISABLED, font=("Arial", 10), bg="#f0f0f0", relief=tk.FLAT)
+info_text = tk.Text(frame, height=11, width=55, wrap=tk.WORD, state=tk.DISABLED, font=("Arial", 10), bg="#f0f0f0", relief=tk.FLAT)
 info_text.pack(pady=10)
 
 if __name__ == "__main__":

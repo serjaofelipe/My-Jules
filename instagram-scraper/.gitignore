@@ -6,3 +6,6 @@ build/
 .env
 *.log
 dados/*.jpg
+
+# dados coletados (prints, fotos e json de cada perfil)
+dados/
