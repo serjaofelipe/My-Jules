@@ -77,11 +77,6 @@ function App() {
 
   return (
     <>
-      {/* Background animado de ondas */}
-      <div className="ocean">
-        <div className="wave"></div>
-        <div className="wave"></div>
-      </div>
 
       <h1>Ligue 4</h1>
 
