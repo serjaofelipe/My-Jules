@@ -273,8 +273,12 @@ def _chamar(page, path, form):
 def buscar_lista(page, uid, qual):
     """Lista de seguidores/seguindo, página por página. Devolve (usuarios, completa?)."""
     usuarios, vistos, max_id = [], set(), ""
+    # Sem "order" a lista vem ranqueada e embaralha entre as páginas: contas repetem,
+    # outras nunca aparecem e o servidor encerra cedo (ex.: 102 de 260 em "seguindo").
+    # Por data de follow a ordem é fixa e a lista vem inteira.
+    ordem = "&order=date_followed_latest" if qual == "following" else ""
     while len(usuarios) < LIMITE_LISTA:
-        corpo = ig_api(page, f"/api/v1/friendships/{uid}/{qual}/?count=50"
+        corpo = ig_api(page, f"/api/v1/friendships/{uid}/{qual}/?count=50{ordem}"
                        + (f"&max_id={max_id}" if max_id else ""), tentativas=2)
         for u in corpo.get("users", []):
             if u.get("username") and u["username"] not in vistos:
