@@ -12,7 +12,8 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-if [ ! -d "node_modules" ]; then
+# Checa o vite em vez da pasta: uma instalacao que falhou no meio deixa node_modules incompleto.
+if [ ! -x "node_modules/.bin/vite" ]; then
     echo "Instalando dependencias do projeto, aguarde..."
     npm install
     if [ $? -ne 0 ]; then
