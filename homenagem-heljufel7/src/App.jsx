@@ -8,25 +8,25 @@ export default function App() {
     name: 'Heljufel7',
     tag: '#BR1',
     icon: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/profileicon/53.png',
-    elo: 'Esmeralda II',
-    lp: 42,
-    winrate: '54%',
+    elo: 'Ouro 4',
+    lp: 75,
+    winrate: '50%',
   };
 
   const mainChampion = {
-    name: 'Ashe',
-    title: 'a Arqueira de Gelo',
-    image: 'https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Ashe_0.jpg',
-    square: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Ashe.png',
-    masteryScore: '1,245,600',
+    name: 'Olaf',
+    title: 'o Berserker',
+    image: 'https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Olaf_0.jpg',
+    square: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Olaf.png',
+    masteryScore: '8,850,970',
     masteryLevel: 7,
   };
 
   const recentMatches = [
-    { result: 'Vitória', kda: '12 / 2 / 8', cs: 210, duration: '28:45', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Ashe.png' },
-    { result: 'Vitória', kda: '8 / 4 / 15', cs: 195, duration: '25:20', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Ashe.png' },
-    { result: 'Derrota', kda: '5 / 6 / 10', cs: 230, duration: '35:10', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Ashe.png' },
-    { result: 'Vitória', kda: '15 / 1 / 9', cs: 180, duration: '22:15', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Ashe.png' },
+    { result: 'Vitória', kda: '12 / 2 / 8', cs: 210, duration: '28:45', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Olaf.png' },
+    { result: 'Vitória', kda: '8 / 4 / 15', cs: 195, duration: '25:20', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Olaf.png' },
+    { result: 'Derrota', kda: '5 / 6 / 10', cs: 230, duration: '35:10', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Olaf.png' },
+    { result: 'Vitória', kda: '15 / 1 / 9', cs: 180, duration: '22:15', champ: 'https://ddragon.leagueoflegends.com/cdn/14.8.1/img/champion/Olaf.png' },
   ];
 
   return (
@@ -86,17 +86,17 @@ export default function App() {
             <div className="stats-grid">
               <div className="stat-item">
                 <TrendingUp className="icon-large text-green" />
-                <span className="stat-value text-green">65%</span>
+                <span className="stat-value text-green">58%</span>
                 <span className="stat-label">Taxa de Vitória</span>
               </div>
               <div className="stat-item">
                 <Skull className="icon-large text-blue" />
-                <span className="stat-value">4.5:1</span>
+                <span className="stat-value">2.10:1</span>
                 <span className="stat-label">KDA Médio</span>
               </div>
               <div className="stat-item">
                 <Crosshair className="icon-large text-purple" />
-                <span className="stat-value">7.8</span>
+                <span className="stat-value">7.4</span>
                 <span className="stat-label">CS / min</span>
               </div>
             </div>
@@ -126,7 +126,7 @@ export default function App() {
         </main>
 
         <footer className="footer">
-          <p>Homenagem ao jogador Heljufel7 - A flecha de cristal nunca erra.</p>
+          <p>Homenagem ao jogador Heljufel7 - O Berserker nunca recua.</p>
         </footer>
       </div>
     </div>
