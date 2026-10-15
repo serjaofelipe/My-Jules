@@ -32,7 +32,6 @@ def preparar():
                 print("[ERRO] Falha ao instalar dependencias. Apague a pasta .venv e tente de novo.")
                 return False
 
-            # Instalar os binários do Playwright logo após instalar as dependências
             subprocess.run([str(PY_VENV), "-m", "playwright", "install", "--with-deps", "chromium"])
 
             MARCA.write_text(atual)
