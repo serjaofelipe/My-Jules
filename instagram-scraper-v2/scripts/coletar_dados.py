@@ -2,7 +2,8 @@
 
 Mídia (fotos e vídeos de posts, reels, stories e destaques) é baixada nos
 arquivos originais (.jpg / .mp4). Os .json guardam só dados de texto:
-histórico do perfil, seguidores, seguindo e legendas/datas/curtidas.
+histórico do perfil, seguidores, seguindo, legendas/datas/curtidas e o
+de-para unfollowers_followed.json (quem o perfil segue e não segue de volta).
 
 Como funciona: o script navega pelo perfil como uma pessoa faria e lê os
 dados que o próprio site do Instagram carrega (respostas GraphQL e o JSON
@@ -29,7 +30,8 @@ MODO_TESTE = os.environ.get("MODO_TESTE") == "1"
 
 LIMITE_POSTS = int(os.environ.get("LIMITE_POSTS", "30"))
 LIMITE_REELS = int(os.environ.get("LIMITE_REELS", "30"))
-LIMITE_LISTA = int(os.environ.get("LIMITE_LISTA", "30"))
+# Seguidores/seguindo vêm completos para o de-para (unfollowers_followed.json) ser confiável.
+LIMITE_LISTA = int(os.environ.get("LIMITE_LISTA", "5000"))
 PAUSA = 1.2  # segundos entre chamadas à API
 INDISPONIVEL = "Dado indisponivel"
 
@@ -269,10 +271,67 @@ def _chamar(page, path, form):
 
 
 def buscar_lista(page, uid, qual):
-    corpo = ig_api(page, f"/api/v1/friendships/{uid}/{qual}/?count={LIMITE_LISTA}", tentativas=1)
-    return [{"usuario": u.get("username"), "nome": u.get("full_name"),
-             "privado": u.get("is_private"), "verificado": u.get("is_verified")}
-            for u in corpo.get("users", [])][:LIMITE_LISTA]
+    """Lista de seguidores/seguindo, página por página. Devolve (usuarios, completa?)."""
+    usuarios, vistos, max_id = [], set(), ""
+    while len(usuarios) < LIMITE_LISTA:
+        corpo = ig_api(page, f"/api/v1/friendships/{uid}/{qual}/?count=50"
+                       + (f"&max_id={max_id}" if max_id else ""), tentativas=2)
+        for u in corpo.get("users", []):
+            if u.get("username") and u["username"] not in vistos:
+                vistos.add(u["username"])
+                usuarios.append({"usuario": u["username"], "nome": u.get("full_name"),
+                                 "privado": u.get("is_private"), "verificado": u.get("is_verified")})
+        max_id = corpo.get("next_max_id")
+        if not max_id:
+            return usuarios, True
+        print(f"  {len(usuarios)}...")
+    return usuarios[:LIMITE_LISTA], False
+
+
+def gerar_depara(pasta, username, seguidores, seguindo, seguidores_antes, contagem_perfil=None):
+    """unfollowers_followed.json: quem o perfil segue e não segue de volta (e o contrário)."""
+    (lista_seguidores, seguidores_completa), (lista_seguindo, seguindo_completa) = seguidores, seguindo
+    nomes_seguidores = {u["usuario"] for u in lista_seguidores}
+    nomes_seguindo = {u["usuario"] for u in lista_seguindo}
+    completo = seguidores_completa and seguindo_completa
+    resultado = {
+        "perfil": username,
+        "data_coleta": datetime.now().isoformat(timespec="seconds"),
+        "listas_completas": completo,
+        "total_seguidores": len(nomes_seguidores),
+        "total_seguindo": len(nomes_seguindo),
+        "nao_seguem_de_volta": sorted((u for u in lista_seguindo if u["usuario"] not in nomes_seguidores),
+                                      key=lambda u: u["usuario"].lower()),
+        "voce_nao_segue_de_volta": sorted((u for u in lista_seguidores if u["usuario"] not in nomes_seguindo),
+                                          key=lambda u: u["usuario"].lower()),
+    }
+    # Quem deixou de seguir desde a coleta anterior (só dá para saber com as duas listas completas).
+    if seguidores_completa and seguidores_antes.get("completa"):
+        resultado["deixaram_de_seguir_desde_ultima_coleta"] = sorted(
+            set(seguidores_antes["usuarios"]) - nomes_seguidores, key=str.lower)
+        resultado["novos_seguidores_desde_ultima_coleta"] = sorted(
+            nomes_seguidores - set(seguidores_antes["usuarios"]), key=str.lower)
+    avisos = []
+    if not completo:
+        avisos.append("Listas incompletas (limite LIMITE_LISTA ou o Instagram parou de responder): "
+                      "o de-para pode ter falsos positivos.")
+    # O número do perfil conta contas desativadas/restritas que o Instagram não lista.
+    for chave, total in (("seguidores", len(nomes_seguidores)), ("seguindo", len(nomes_seguindo))):
+        no_perfil = (contagem_perfil or {}).get(chave)
+        if isinstance(no_perfil, int):
+            resultado[f"{chave}_no_perfil"] = no_perfil
+            if no_perfil - total > max(5, no_perfil * 0.05):
+                avisos.append(f"O perfil mostra {no_perfil} em '{chave}', mas o Instagram so lista {total}. "
+                              "Os que faltam (contas desativadas/restritas) ficam fora do de-para.")
+    if avisos:
+        resultado["avisos"] = avisos
+    resultado["quantidade_nao_seguem_de_volta"] = len(resultado["nao_seguem_de_volta"])
+    resultado["quantidade_voce_nao_segue_de_volta"] = len(resultado["voce_nao_segue_de_volta"])
+    salvar_json(resultado, pasta / "unfollowers_followed.json")
+    print(f"De-para: {resultado['quantidade_nao_seguem_de_volta']} que {username} segue e nao seguem de volta"
+          + ("" if completo else " (listas incompletas!)"))
+    for aviso in avisos:
+        print(f"  [aviso] {aviso}")
 
 
 # ---------------------------------------------------------------- download
@@ -521,14 +580,24 @@ def coletar_alvo(username):
                 if uid:
                     page.goto(url_alvo, wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_timeout(3000)
-                    print(f"Extraindo seguidores (ate {LIMITE_LISTA})...")
+                    # Lista da coleta anterior, para saber quem deixou de seguir.
+                    anterior = ler_json(PASTA_PERFIL / "seguidores.json", [])
+                    seguidores_antes = {
+                        "usuarios": [u["usuario"] for u in anterior if isinstance(u, dict) and u.get("usuario")],
+                        "completa": ler_json(PASTA_PERFIL / "unfollowers_followed.json", {}).get("listas_completas"),
+                    }
+                    print("Extraindo seguidores (lista completa)...")
                     seguidores = etapa("seguidores", lambda: buscar_lista(page, uid, "followers"), erros)
                     if seguidores is not None:
-                        salvar_json(seguidores, PASTA_PERFIL / "seguidores.json")
-                    print(f"Extraindo seguindo (ate {LIMITE_LISTA})...")
+                        salvar_json(seguidores[0], PASTA_PERFIL / "seguidores.json")
+                    print("Extraindo seguindo (lista completa)...")
                     seguindo = etapa("seguindo", lambda: buscar_lista(page, uid, "following"), erros)
                     if seguindo is not None:
-                        salvar_json(seguindo, PASTA_PERFIL / "seguindo.json")
+                        salvar_json(seguindo[0], PASTA_PERFIL / "seguindo.json")
+                    if seguidores is not None and seguindo is not None:
+                        gerar_depara(PASTA_PERFIL, username, seguidores, seguindo, seguidores_antes,
+                                     {"seguidores": dados_gerais.get("seguidores"),
+                                      "seguindo": dados_gerais.get("seguindo")})
 
                 dados_gerais["baixados"] = {
                     "posts": len(posts), "reels": len(reels), "stories": len(stories),
