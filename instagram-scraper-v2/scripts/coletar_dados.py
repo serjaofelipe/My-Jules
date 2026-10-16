@@ -10,8 +10,8 @@ dados que o próprio site do Instagram carrega (respostas GraphQL e o JSON
 embutido no HTML). Os endereços antigos da API (/api/v1/feed/...) passaram
 a devolver só a página HTML, por isso não são mais usados para mídia.
 
-Limites (para não chamar atenção do Instagram) podem ser mudados por
-variável de ambiente: LIMITE_POSTS, LIMITE_REELS e LIMITE_LISTA.
+Por padrão posts, reels, stories e destaques vêm todos. Dá para pôr um teto
+em posts/reels por variável de ambiente (LIMITE_POSTS, LIMITE_REELS); 0 = tudo.
 """
 
 import json
@@ -30,8 +30,10 @@ PASTA_DADOS = RAIZ / "dados"
 ARQUIVO_ESTADO = PASTA_DADOS / "estado_login.json"
 MODO_TESTE = os.environ.get("MODO_TESTE") == "1"
 
-LIMITE_POSTS = int(os.environ.get("LIMITE_POSTS", "30"))
-LIMITE_REELS = int(os.environ.get("LIMITE_REELS", "30"))
+SEM_LIMITE = 10 ** 9  # "baixar tudo": rola até o Instagram parar de mandar mídia nova
+# 0 (padrão) = sem limite; pode-se pôr um teto por variável de ambiente.
+LIMITE_POSTS = int(os.environ.get("LIMITE_POSTS", "0")) or SEM_LIMITE
+LIMITE_REELS = int(os.environ.get("LIMITE_REELS", "0")) or SEM_LIMITE
 # Seguidores/seguindo vêm completos para o de-para (unfollowers_followed.json) ser confiável.
 LIMITE_LISTA = int(os.environ.get("LIMITE_LISTA", "5000"))
 PAUSA = 1.2  # segundos entre chamadas à API
@@ -303,15 +305,20 @@ def unicos(midias):
 
 
 def rolar_e_coletar(page, captura, consultas, limite):
-    """Rola a página até ter `limite` mídias das consultas indicadas (ou parar de vir novas)."""
+    """Rola a página até ter `limite` mídias (ou até o fim, se limite for muito alto).
+
+    Para após algumas rolagens seguidas sem mídia nova. A tolerância é maior
+    quando se quer tudo, para um perfil grande não parar cedo numa carga lenta.
+    """
+    tolerancia = 5 if limite >= SEM_LIMITE else 3
     midias, parado = [], 0
-    while parado < 3:
+    while parado < tolerancia:
         midias = unicos(m for d in captura.de(*consultas) for m in achar_midias(d))
         if len(midias) >= limite:
             break
         antes = len(midias)
         page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(3000)
         depois = len(unicos(m for d in captura.de(*consultas) for m in achar_midias(d)))
         parado = parado + 1 if depois == antes else 0
     return midias[:limite]
@@ -710,14 +717,14 @@ def coletar_alvo(username, opcoes=OPCOES):
                 bandeja = lista_de_destaques(captura, page) if "destaques" in opcoes else []
 
                 if "posts" in opcoes:
-                    print(f"Baixando posts (ate {LIMITE_POSTS})...")
+                    print(f"Baixando posts ({'todos' if LIMITE_POSTS >= SEM_LIMITE else f'ate {LIMITE_POSTS}'})...")
                     posts = etapa("posts", lambda: rolar_e_coletar(page, captura, ("ProfilePosts",), LIMITE_POSTS),
                                   erros) or []
                     salvar_json(salvar_midias(context, posts, pastas["posts"], "post"), pastas["posts"] / "posts.json")
                     baixados["posts"] = len(posts)
 
                 if "reels" in opcoes:
-                    print(f"Baixando reels (ate {LIMITE_REELS})...")
+                    print(f"Baixando reels ({'todos' if LIMITE_REELS >= SEM_LIMITE else f'ate {LIMITE_REELS}'})...")
                     captura.limpar()
                     page.goto(f"{url_alvo}reels/", wait_until="load", timeout=60000)
                     page.wait_for_timeout(6000)
