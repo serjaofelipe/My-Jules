@@ -51,6 +51,11 @@ def abrir_quando_pronto(url):
 def main():
     if not preparar():
         return 1
+    # A janela do AJAXGRAM abre sem console (pythonw); o log da coleta fica nela.
+    pyw = PY_VENV.with_name("pythonw.exe")
+    if os.name == "nt" and pyw.exists():
+        subprocess.Popen([str(pyw), str(PRINCIPAL)], cwd=RAIZ)
+        return 0
     proc = subprocess.Popen([str(PY_VENV), str(PRINCIPAL)], cwd=RAIZ)
     if URL_APP and not os.environ.get("SEM_NAVEGADOR"):
         abrir_quando_pronto(URL_APP)

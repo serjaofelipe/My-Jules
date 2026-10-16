@@ -9,4 +9,8 @@ Ele busca coletar fotos, vídeos, stories (se visíveis) e também dados numéri
 - Instale o **Python 3** (https://www.python.org/downloads/) certificando-se de marcar a opção "Add python.exe to PATH" durante a instalação.
 - Dê um duplo clique no arquivo `iniciar.bat` (no Windows) ou `iniciar.command` (no macOS, lembre-se de clicar com botão direito e escolher "Abrir" na primeira vez).
 
-Os dados coletados serão salvos de forma organizada na pasta `dados`, sendo gerada uma subpasta para cada perfil.
+Abre a janela do **AJAXGRAM**: digite o perfil, marque o que quer puxar (posts, reels, stories, destaques, seguidores, seguindo e o de-para) e clique em **▶ COLETAR**. O andamento aparece no log da janela; o botão **■ parar** encerra a coleta e **[ trocar conta ]** apaga a sessão salva para logar de novo.
+
+Os dados coletados serão salvos de forma organizada na pasta `dados`, sendo gerada uma subpasta para cada perfil. O log da última coleta fica em `dados/<perfil>/ultima_coleta.log`.
+
+Também dá para rodar sem a janela: `python scripts/coletar_dados.py <perfil> --so posts,destaques,depara`.
