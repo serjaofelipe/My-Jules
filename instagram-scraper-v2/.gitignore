@@ -1,0 +1,11 @@
+node_modules/
+.venv/
+__pycache__/
+dist/
+build/
+.env
+*.log
+dados/estado_login.json
+
+# fotos, videos e json coletados de cada perfil
+dados/
