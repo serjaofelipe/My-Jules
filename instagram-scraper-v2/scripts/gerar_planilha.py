@@ -205,27 +205,30 @@ def _aba_depara(wb, dp):
         cel.alignment = Alignment(horizontal="left", vertical="center", indent=1, wrap_text=True)
         ws.row_dimensions[r].height = 30
 
-    # Tabela: quem o perfil segue e nao e seguido de volta.
+    def tabela(r, titulo, pessoas):
+        """Título + tabela de pessoas a partir da linha r. Devolve a próxima linha livre."""
+        tit = ws.cell(row=r, column=1, value=titulo)
+        tit.font = _fonte(13, ROXO, negrito=True)
+        r += 1
+        _cabecalho(ws, ["#", "Usuario", "Nome", "Privado", "Verificado"], linha=r)
+        for n, p in enumerate(pessoas):
+            rr = r + 1 + n
+            fundo = _preencher(ROSA_CLARO if n % 2 else BRANCO)
+            for c, valor in enumerate([n + 1, "@" + p.get("usuario", ""), p.get("nome") or "",
+                                       _sim_nao(p.get("privado")), _sim_nao(p.get("verificado"))], 1):
+                cel = ws.cell(row=rr, column=c, value=valor)
+                cel.font = _fonte(10)
+                cel.fill = fundo
+                cel.border = BORDA
+                meio = "center" if c in (1, 4, 5) else "left"
+                cel.alignment = Alignment(horizontal=meio, vertical="center", indent=0 if meio == "center" else 1)
+        return r + 1 + len(pessoas) + 2  # pula 2 linhas até a próxima tabela
+
     r += 2
-    tit = ws.cell(row=r, column=1, value="Seguidos que NAO retribuem (candidatos a unfollow)")
-    tit.font = _fonte(13, ROXO, negrito=True)
-    r += 1
-    _cabecalho(ws, ["#", "Usuario", "Nome", "Privado", "Verificado"], linha=r)
-    pessoas = dp.get("nao_seguem_de_volta") or []
-    for n, p in enumerate(pessoas):
-        rr = r + 1 + n
-        fundo = _preencher(ROSA_CLARO if n % 2 else BRANCO)
-        for c, valor in enumerate([n + 1, "@" + p.get("usuario", ""), p.get("nome") or "",
-                                   _sim_nao(p.get("privado")), _sim_nao(p.get("verificado"))], 1):
-            cel = ws.cell(row=rr, column=c, value=valor)
-            cel.font = _fonte(10)
-            cel.fill = fundo
-            cel.border = BORDA
-            meio = "center" if c in (1, 4, 5) else "left"
-            cel.alignment = Alignment(horizontal=meio, vertical="center", indent=0 if meio == "center" else 1)
+    r = tabela(r, "Seguidos que NAO retribuem (candidatos a unfollow)", dp.get("nao_seguem_de_volta") or [])
+    tabela(r, "Te seguem e voce NAO segue de volta", dp.get("voce_nao_segue_de_volta") or [])
     for i, larg in enumerate([6, 26, 34, 11, 13], 1):
         ws.column_dimensions[get_column_letter(i)].width = larg
-    ws.freeze_panes = f"A{r + 1}"
     ws.sheet_view.showGridLines = False
 
 
