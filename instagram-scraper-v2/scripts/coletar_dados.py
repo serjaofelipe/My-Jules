@@ -25,6 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
+import contas
+
 RAIZ = Path(__file__).resolve().parent.parent
 PASTA_DADOS = RAIZ / "dados"
 ARQUIVO_ESTADO = PASTA_DADOS / "estado_login.json"
@@ -384,13 +386,15 @@ PASSADAS_LISTA = [
 ]
 
 
-def buscar_lista(page, uid, qual, alvo=None):
+def buscar_lista(page, uid, qual, alvo=None, usuarios=None):
     """Lista de seguidores/seguindo. Devolve (usuarios, completa?).
 
     `alvo` é o número que o perfil mostra: as passadas param ao alcançá-lo
     (ou quando uma passada não traz ninguém novo).
+    `usuarios` é um dict {username: dados} para continuar de onde outra conta
+    parou (juntar contas); se None, começa do zero.
     """
-    usuarios = {}
+    usuarios = {} if usuarios is None else usuarios
     completa = False
     for n, parametros in enumerate(PASSADAS_LISTA, 1):
         antes, max_id = len(usuarios), ""
@@ -420,6 +424,74 @@ def buscar_lista(page, uid, qual, alvo=None):
         if n > 1 and novos == 0:
             break  # o resto não aparece em nenhuma ordem (contas desativadas/restritas)
     return list(usuarios.values())[:LIMITE_LISTA], completa
+
+
+def coletar_lista_pool(p, uid, qual, alvo, url_alvo, page_ativa, extras):
+    """Junta várias contas para fechar a lista.
+
+    Começa pela conta ativa (página já aberta). Se não bater `alvo`, abre cada
+    conta extra num navegador próprio e continua somando só os usuários novos,
+    até bater o alvo ou acabarem as contas. Sem `alvo` conhecido não arrisca
+    outras contas (pararia sem saber se já tem tudo).
+    """
+    usuarios = {}
+    completa = False
+    try:
+        _, completa = buscar_lista(page_ativa, uid, qual, alvo, usuarios)
+    except RuntimeError as e:
+        print(f"  [aviso] conta ativa bloqueada em {qual}: {e}")
+
+    tem_alvo = isinstance(alvo, int) and alvo > 0
+    for nome, sessao in extras:
+        if not tem_alvo or len(usuarios) >= alvo:
+            break
+        print(f"  juntando a conta '{nome}' para completar {qual}...")
+        navegador = abrir_navegador(p, headless=True)
+        try:
+            ctx = novo_contexto(navegador, storage_state=str(sessao))
+            pg = ctx.new_page()
+            if not tem_sessao(ctx):
+                print(f"  [aviso] conta '{nome}' sem sessao valida, pulando.")
+                continue
+            pg.goto(url_alvo, wait_until="domcontentloaded", timeout=60000)
+            pg.wait_for_timeout(3000)
+            antes = len(usuarios)
+            try:
+                _, c = buscar_lista(pg, uid, qual, alvo, usuarios)
+                completa = completa or c
+            except RuntimeError as e:
+                print(f"  [aviso] conta '{nome}' bloqueada em {qual}: {e}")
+            print(f"  conta '{nome}': +{len(usuarios) - antes} (total {len(usuarios)}"
+                  + (f" de {alvo}" if tem_alvo else "") + ")")
+        finally:
+            navegador.close()
+    if not usuarios:
+        raise RuntimeError("nenhuma conta conseguiu abrir esta lista (bloqueio do Instagram).")
+    return list(usuarios.values())[:LIMITE_LISTA], completa
+
+
+def adicionar_conta_por_login(nome):
+    """Abre o navegador para logar e salva como uma nova conta (ativa)."""
+    with sync_playwright() as p:
+        print(f"Abrindo o navegador para logar na conta '{nome}'...")
+        print("A janela fecha sozinha quando o login terminar.")
+        navegador = abrir_navegador(p, headless=False)
+        context = novo_contexto(navegador)
+        page = context.new_page()
+        page.goto("https://www.instagram.com/accounts/login/")
+        try:
+            fim = time.time() + 300
+            while not tem_sessao(context):
+                if time.time() > fim:
+                    raise TimeoutError
+                page.wait_for_timeout(1000)
+            page.wait_for_timeout(3000)
+            estado = context.storage_state()
+        except Exception:
+            navegador.close()
+            raise RuntimeError("tempo esgotado ou janela fechada antes do login.") from None
+        navegador.close()
+    return contas.registrar(nome, estado)
 
 
 def gerar_depara(pasta, username, seguidores, seguindo, seguidores_antes, contagem_perfil=None):
@@ -780,18 +852,21 @@ def coletar_alvo(username, opcoes=OPCOES):
                         "usuarios": [u["usuario"] for u in anterior if isinstance(u, dict) and u.get("usuario")],
                         "completa": ler_json(PASTA_LOGS / "unfollowers_followed.json", {}).get("listas_completas"),
                     }
+                    extras = contas.sessoes_pool(excluir_ativa=True)
+                    if extras:
+                        print(f"Contas extras disponiveis para juntar: {len(extras)}")
                     seguidores = seguindo = None
                     if "seguidores" in opcoes:
                         print("Extraindo seguidores (lista completa)...")
-                        seguidores = etapa("seguidores", lambda: buscar_lista(
-                            page, uid, "followers", dados_gerais.get("seguidores")), erros)
+                        seguidores = etapa("seguidores", lambda: coletar_lista_pool(
+                            p, uid, "followers", dados_gerais.get("seguidores"), url_alvo, page, extras), erros)
                         if seguidores is not None:
                             salvar_json(seguidores[0], PASTA_LOGS / "seguidores.json")
                             print(f"  {len(seguidores[0])} seguidores salvos.")
                     if "seguindo" in opcoes:
                         print("Extraindo seguindo (lista completa)...")
-                        seguindo = etapa("seguindo", lambda: buscar_lista(
-                            page, uid, "following", dados_gerais.get("seguindo")), erros)
+                        seguindo = etapa("seguindo", lambda: coletar_lista_pool(
+                            p, uid, "following", dados_gerais.get("seguindo"), url_alvo, page, extras), erros)
                         if seguindo is not None:
                             salvar_json(seguindo[0], PASTA_LOGS / "seguindo.json")
                             print(f"  {len(seguindo[0])} perfis em seguindo salvos.")
@@ -849,7 +924,17 @@ if __name__ == "__main__":
                     help=f"o que baixar, separado por virgula: {','.join(OPCOES)}")
     ap.add_argument("--importar-chrome", metavar="PERFIL",
                     help='so importa o login do Instagram de um perfil do Chrome ("Profile 4" ou o e-mail)')
+    ap.add_argument("--login-conta", metavar="NOME",
+                    help="abre o navegador para logar e salva como uma nova conta com esse nome")
     args = ap.parse_args()
+    if args.login_conta:
+        try:
+            cid = adicionar_conta_por_login(args.login_conta)
+        except Exception as e:
+            print(f"Erro ao adicionar a conta: {e}")
+            sys.exit(1)
+        print(f"Conta '{args.login_conta}' adicionada e ativada com sucesso! (id {cid})")
+        sys.exit(0)
     if args.importar_chrome:
         try:
             pasta = importar_do_chrome(args.importar_chrome)

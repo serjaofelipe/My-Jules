@@ -14,19 +14,23 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
 RAIZ = Path(__file__).resolve().parent.parent
 SCRIPT_COLETA = RAIZ / "scripts" / "coletar_dados.py"
+SCRIPT_COMPARATIVO = RAIZ / "scripts" / "gerar_comparativo.py"
 ASSETS = RAIZ / "scripts" / "assets"
 PASTA_DADOS = RAIZ / "dados"
 ARQUIVO_ESTADO = PASTA_DADOS / "estado_login.json"
 PREFERENCIAS = PASTA_DADOS / "ajaxgram.json"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # para importar contas/gerar_comparativo
+import contas  # noqa: E402
+
 APP_NAME = "A J A X G R A M"
 
-# (chave do coletar_dados.py, texto na janela, explicação)
+# (chave, texto na janela, explicação). "depara_contas" não é coletado: abre o comparativo.
 OPCOES = [
     ("posts", "posts", "fotos e vídeos do feed"),
     ("reels", "reels", "vídeos da aba reels"),
@@ -35,6 +39,7 @@ OPCOES = [
     ("seguidores", "seguidores", "lista de quem segue o perfil"),
     ("seguindo", "seguindo", "lista de quem o perfil segue"),
     ("depara", "de-para", "quem não segue de volta (usa as duas listas)"),
+    ("depara_contas", "de-para: +contas", "compara perfis já coletados (abre a lista)"),
 ]
 
 # ---------------------------------------------------------------- tema (cores do Instagram, modo escuro)
@@ -187,6 +192,7 @@ class App(tk.Tk):
         self.proc = None
         self.log_file = None
         self.perfil_atual = None
+        self._comparar_depois = False
         self.inicio = 0.0
         self._linhas = queue.Queue()
         self._spin = 0
@@ -246,14 +252,10 @@ class App(tk.Tk):
         info.pack(side="right", anchor="e")
         self.login_label = tk.Label(info, text="", font=(self.mono, 9), bg=C["bg"])
         self.login_label.pack(anchor="e")
-        self.trocar_btn = tk.Label(info, text="[ trocar conta ]", font=(self.mono, 9), fg=C["dim"],
-                                   bg=C["bg"], cursor="hand2")
-        self.trocar_btn.pack(anchor="e")
-        self.trocar_btn.bind("<Button-1>", lambda e: self.trocar_conta())
-        chrome_btn = tk.Label(info, text="[ login do chrome ]", font=(self.mono, 9), fg=C["dim"],
-                              bg=C["bg"], cursor="hand2")
-        chrome_btn.pack(anchor="e")
-        chrome_btn.bind("<Button-1>", lambda e: self.login_do_chrome())
+        self.gerenciar_btn = tk.Label(info, text="[ gerenciar contas ]", font=(self.mono, 9), fg=C["pink"],
+                                      bg=C["bg"], cursor="hand2")
+        self.gerenciar_btn.pack(anchor="e")
+        self.gerenciar_btn.bind("<Button-1>", lambda e: self.gerenciar_contas())
 
         # Linha em degradê embaixo do título.
         self.faixa = tk.Canvas(self, height=3, bg=C["bg"], highlightthickness=0)
@@ -295,11 +297,12 @@ class App(tk.Tk):
         dentro.columnconfigure(0, weight=1)
         dentro.columnconfigure(1, weight=1)
         self.checks = {}
+        full = 0  # os de-para ocupam a linha inteira, embaixo
         for i, (chave, texto, ajuda) in enumerate(OPCOES):
             cel = tk.Frame(dentro, bg=C["bg"])
-            # de-para ocupa a linha inteira no fim.
-            if chave == "depara":
-                cel.grid(row=i // 2 + 1, column=0, columnspan=2, sticky="w", pady=(6, 2))
+            if chave in ("depara", "depara_contas"):
+                cel.grid(row=3 + full, column=0, columnspan=2, sticky="w", pady=(6 if full == 0 else 2, 2))
+                full += 1
             else:
                 cel.grid(row=i // 2, column=i % 2, sticky="w", pady=2)
             cb = ttk.Checkbutton(cel, text=texto, variable=self.vars[chave],
@@ -374,68 +377,157 @@ class App(tk.Tk):
             pass
 
     def _atualizar_login(self):
-        if ARQUIVO_ESTADO.exists():
+        lista = contas.listar()
+        ativa = contas.ativa_id()
+        nome = next((c["nome"] for c in lista if c["id"] == ativa), None)
+        if nome:
+            extra = f"  (+{len(lista) - 1})" if len(lista) > 1 else ""
+            self.login_label.configure(text=f"● {nome}{extra}", fg=C["green"])
+        elif ARQUIVO_ESTADO.exists():
             self.login_label.configure(text="● sessão salva", fg=C["green"])
         else:
-            self.login_label.configure(text="○ sem login (vai abrir o navegador)", fg=C["orange"])
+            self.login_label.configure(text="○ sem conta (vai abrir o navegador)", fg=C["orange"])
 
-    def trocar_conta(self):
+    def gerenciar_contas(self):
+        """Adiciona, ativa, renomeia e remove contas do Instagram."""
         if self.proc:
             return
-        if not ARQUIVO_ESTADO.exists():
-            messagebox.showinfo(APP_NAME, "Nenhuma sessão salva. Na próxima coleta o navegador abre para você logar.")
-            return
-        if messagebox.askyesno(APP_NAME, "Apagar a sessão salva?\nNa próxima coleta o navegador abre para "
-                                         "você logar de novo (pode ser outra conta)."):
-            ARQUIVO_ESTADO.unlink(missing_ok=True)
-            self._atualizar_login()
-            self.escrever("sessão apagada: na próxima coleta você loga de novo.", "aviso")
-
-    def login_do_chrome(self):
-        """Escolhe um perfil do Chrome e importa o login do Instagram dele."""
-        if self.proc:
-            return
-        sys.path.insert(0, str(SCRIPT_COLETA.parent))
-        from coletar_dados import perfis_do_chrome
-        perfis = perfis_do_chrome()
-        if not perfis:
-            messagebox.showerror(APP_NAME, "Não achei o Google Chrome instalado neste computador.")
-            return
-
         win = tk.Toplevel(self, bg=C["bg"])
-        win.title(f"{APP_NAME} · login do chrome")
-        win.geometry("560x360")
+        win.title(f"{APP_NAME} · gerenciar contas")
+        win.geometry("540x420")
         win.transient(self)
         dark_title_bar(win)
-        ttk.Label(win, text="> de qual perfil do Chrome puxar o login do Instagram?_",
-                  style="Prompt.TLabel").pack(anchor="w", padx=14, pady=(12, 2))
-        ttk.Label(win, text="feche o Chrome antes: aberto, ele trava os cookies.",
-                  style="Dim.TLabel").pack(anchor="w", padx=14, pady=(0, 6))
+        ttk.Label(win, text="> suas contas do Instagram_", style="Prompt.TLabel").pack(anchor="w", padx=14,
+                                                                                      pady=(12, 2))
+        ttk.Label(win, text="marque a conta e use os botões abaixo. a ativa é a usada nas coletas; "
+                            "as outras entram para completar as listas.", style="Dim.TLabel",
+                  wraplength=500).pack(anchor="w", padx=14, pady=(0, 8))
         moldura = tk.Frame(win, bg=C["border"], padx=1, pady=1)
         moldura.pack(fill="both", expand=True, padx=14)
-        lb = tk.Listbox(moldura, font=(self.mono, 10), bg=C["field"], fg=C["fg"], borderwidth=0,
-                        highlightthickness=0, selectbackground=C["select"], selectforeground=C["pink"],
-                        activestyle="none")
-        lb.pack(fill="both", expand=True)
-        for pasta, nome, email in perfis:
-            lb.insert("end", f" {nome:<18} {email or '(sem conta Google)':<32} {pasta}")
+        lista_frame = tk.Frame(moldura, bg=C["field"])
+        lista_frame.pack(fill="both", expand=True)
+        marcadas = {}
 
-        def importar(_=None):
-            sel = lb.curselection()
-            if not sel:
+        def recarregar():
+            for w in lista_frame.winfo_children():
+                w.destroy()
+            marcadas.clear()
+            lista = contas.listar()
+            ativa = contas.ativa_id()
+            if not lista:
+                tk.Label(lista_frame, text="  nenhuma conta ainda. clique em [ + adicionar conta ].",
+                         font=(self.mono, 10), bg=C["field"], fg=C["dim"]).pack(anchor="w", pady=10, padx=8)
+            for c in lista:
+                var = tk.BooleanVar(value=False)
+                marcadas[c["id"]] = var
+                linha = tk.Frame(lista_frame, bg=C["field"])
+                linha.pack(fill="x", padx=6, pady=2)
+                ttk.Checkbutton(linha, variable=var).pack(side="left")
+                marca = "★ ativa" if c["id"] == ativa else ""
+                tk.Label(linha, text=c["nome"], font=(self.mono, 11, "bold"), bg=C["field"],
+                         fg=C["pink"] if c["id"] == ativa else C["fg"]).pack(side="left", padx=(4, 8))
+                tk.Label(linha, text=marca, font=(self.mono, 9), bg=C["field"],
+                         fg=C["green"]).pack(side="left")
+            self._atualizar_login()
+
+        def marcada_unica(acao):
+            ids = [cid for cid, v in marcadas.items() if v.get()]
+            if len(ids) != 1:
+                messagebox.showinfo(APP_NAME, f"Marque exatamente 1 conta para {acao}.")
+                return None
+            return ids[0]
+
+        def adicionar():
+            nome = simpledialog.askstring(APP_NAME, "Nome para a nova conta (ex.: Principal, Secundaria):",
+                                          parent=win)
+            if not nome or not nome.strip():
                 return
-            pasta, nome, _email = perfis[sel[0]]
             win.destroy()
             self.log.configure(state="normal")
             self.log.delete("1.0", "end")
             self.log.configure(state="disabled")
-            self.escrever(f"» importando o login do Instagram do perfil '{nome}' do Chrome...", "etapa")
-            self._rodar(["--importar-chrome", pasta], f"login do chrome ({nome})")
+            self.escrever(f"» abrindo o navegador para logar na conta '{nome.strip()}'...", "etapa")
+            self.escrever("» faça o login até o fim; a janela fecha sozinha.", "aviso")
+            self.log_file = None
+            self._rodar(["--login-conta", nome.strip()], f"login ({nome.strip()})")
 
-        lb.bind("<Double-Button-1>", importar)
-        lb.bind("<Return>", importar)
-        ttk.Button(win, text="▶ IMPORTAR", style="Accent.TButton", command=importar).pack(pady=12)
-        lb.focus_set()
+        def ativar():
+            cid = marcada_unica("tornar ativa")
+            if cid:
+                contas.usar(cid)
+                recarregar()
+
+        def renomear():
+            cid = marcada_unica("renomear")
+            if not cid:
+                return
+            atual = next((c["nome"] for c in contas.listar() if c["id"] == cid), "")
+            novo = simpledialog.askstring(APP_NAME, "Novo nome:", initialvalue=atual, parent=win)
+            if novo and novo.strip():
+                contas.renomear(cid, novo.strip())
+                recarregar()
+
+        def remover():
+            ids = [cid for cid, v in marcadas.items() if v.get()]
+            if not ids:
+                messagebox.showinfo(APP_NAME, "Marque a(s) conta(s) para remover.")
+                return
+            if messagebox.askyesno(APP_NAME, f"Remover {len(ids)} conta(s)? O login salvo delas será apagado."):
+                for cid in ids:
+                    contas.remover(cid)
+                recarregar()
+
+        botoes = ttk.Frame(win)
+        botoes.pack(fill="x", padx=14, pady=10)
+        ttk.Button(botoes, text="+ adicionar conta", style="Accent.TButton", command=adicionar).pack(side="left")
+        ttk.Button(botoes, text="tornar ativa", command=ativar).pack(side="left", padx=6)
+        ttk.Button(botoes, text="renomear", command=renomear).pack(side="left")
+        ttk.Button(botoes, text="remover", style="Stop.TButton", command=remover).pack(side="left", padx=6)
+        recarregar()
+
+    def comparar_contas(self):
+        """Abre a lista de perfis já coletados e gera a planilha comparativa (Merge)."""
+        if self.proc:
+            return
+        import gerar_comparativo
+        perfis = gerar_comparativo.perfis_coletados()
+        if len(perfis) < 2:
+            messagebox.showinfo(APP_NAME, "Preciso de pelo menos 2 perfis já coletados "
+                                          "(com seguidores ou seguindo salvos).")
+            return
+        win = tk.Toplevel(self, bg=C["bg"])
+        win.title(f"{APP_NAME} · de-para +contas")
+        win.geometry("480x420")
+        win.transient(self)
+        dark_title_bar(win)
+        ttk.Label(win, text="> marque 2 ou mais perfis para comparar_",
+                  style="Prompt.TLabel").pack(anchor="w", padx=14, pady=(12, 2))
+        ttk.Label(win, text="usa os dados já coletados. salva em dados/Merge-...",
+                  style="Dim.TLabel").pack(anchor="w", padx=14, pady=(0, 8))
+        moldura = tk.Frame(win, bg=C["border"], padx=1, pady=1)
+        moldura.pack(fill="both", expand=True, padx=14)
+        dentro = tk.Frame(moldura, bg=C["field"])
+        dentro.pack(fill="both", expand=True)
+        marcados = {}
+        for p in perfis:
+            v = tk.BooleanVar(value=False)
+            marcados[p] = v
+            ttk.Checkbutton(dentro, text="@" + p, variable=v).pack(anchor="w", padx=8, pady=2)
+
+        def gerar():
+            escolhidos = [p for p, v in marcados.items() if v.get()]
+            if len(escolhidos) < 2:
+                messagebox.showwarning(APP_NAME, "Marque pelo menos 2 perfis.")
+                return
+            win.destroy()
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.configure(state="disabled")
+            self.escrever("» comparando: " + ", ".join("@" + p for p in escolhidos), "etapa")
+            self.log_file = None
+            self._rodar(escolhidos, "comparativo", script=SCRIPT_COMPARATIVO)
+
+        ttk.Button(win, text="▶ GERAR COMPARATIVO", style="Accent.TButton", command=gerar).pack(pady=12)
 
     # ------------------------------------------------ log
 
@@ -454,10 +546,12 @@ class App(tk.Tk):
             return "erro"
         if "[aviso]" in baixa or "429" in baixa or "incompleta" in baixa or "bloqueou" in baixa:
             return "aviso"
-        if "sucesso" in baixa or "salvos em" in baixa or "salva!" in baixa:
+        if "sucesso" in baixa or "salvos em" in baixa or "salva!" in baixa or "gerado em" in baixa:
             return "ok"
-        if linha.startswith(("Baixando", "Extraindo", "Acessando")):
+        if linha.startswith(("Baixando", "Extraindo", "Acessando", "Contas", "Abrindo")):
             return "etapa"
+        if linha.startswith(("  passada", "  conta", "  juntando")):
+            return "dim"
         if linha.startswith("  "):
             return "dim"
         return "info" if linha.startswith(("Sessao", "Autenticacao", "Login", "Aguardando")) else None
@@ -467,6 +561,16 @@ class App(tk.Tk):
     def coletar(self):
         if self.proc:
             return
+        opcoes = self.escolhidas()
+        self._salvar_prefs()
+        quer_comparar = "depara_contas" in opcoes
+        opcoes_coleta = [o for o in opcoes if o != "depara_contas"]
+
+        # "de-para: +contas" sozinho não precisa de perfil alvo: abre o comparativo.
+        if quer_comparar and not opcoes_coleta:
+            self.comparar_contas()
+            return
+
         perfil = self.perfil_var.get().strip().lstrip("@").strip()
         if "instagram.com/" in perfil:  # aceita o link do perfil também
             perfil = perfil.split("instagram.com/", 1)[1].split("/")[0].split("?")[0]
@@ -475,8 +579,7 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, "Digite o perfil (sem @).")
             self.entry.focus_set()
             return
-        opcoes = self.escolhidas()
-        self._salvar_prefs()
+        self._comparar_depois = quer_comparar  # abre o comparativo quando a coleta terminar
 
         pasta = PASTA_DADOS / perfil
         pasta.mkdir(parents=True, exist_ok=True)
@@ -488,17 +591,17 @@ class App(tk.Tk):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        nomes = ", ".join(t for k, t, _ in OPCOES if k in opcoes) or "só os dados do perfil"
+        nomes = ", ".join(t for k, t, _ in OPCOES if k in opcoes_coleta) or "só os dados do perfil"
         self.escrever(f"» coletando @{perfil}: {nomes}", "etapa")
         if not ARQUIVO_ESTADO.exists():
             self.escrever("» o navegador vai abrir para você logar. Faça o login até o fim.", "aviso")
 
-        self._rodar([perfil, "--so", ",".join(opcoes)], f"@{perfil}")
+        self._rodar([perfil, "--so", ",".join(opcoes_coleta)], f"@{perfil}")
 
-    def _rodar(self, argumentos, rotulo):
-        """Roda o coletar_dados.py com estes argumentos, mostrando a saída no log."""
+    def _rodar(self, argumentos, rotulo, script=SCRIPT_COLETA):
+        """Roda um script (coleta ou comparativo) mostrando a saída no log."""
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-        cmd = [python_de_console(), "-u", str(SCRIPT_COLETA), *argumentos]
+        cmd = [python_de_console(), "-u", str(script), *argumentos]
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=RAIZ, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -553,6 +656,9 @@ class App(tk.Tk):
         self._travar(False)
         self._atualizar_login()
         self.bell()
+        if getattr(self, "_comparar_depois", False) and codigo == 0:
+            self._comparar_depois = False
+            self.after(600, self.comparar_contas)
 
     def parar(self):
         proc = self.proc
